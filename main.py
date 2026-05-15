@@ -5,6 +5,7 @@ from cryptography.fernet import Fernet
 import base64
 import urllib.parse
 import io
+import numpy as np
 
 app = FastAPI()
 
@@ -22,17 +23,13 @@ app.add_middleware(
 
 CONTENT_TEXT = 0
 CONTENT_FILE = 2 
-DELIMITER = '1111111111111110'
+# AES Fernet output is Base64, it only contains letters, numbers, and =, -, _
+# So '::::END::::' is a 100% safe and fast byte delimiter.
+DELIMITER = b'::::END::::' 
 
 def generate_key(passcode: str) -> Fernet:
     key = base64.urlsafe_b64encode(passcode.ljust(32).encode()[:32])
     return Fernet(key)
-
-def content_to_binary(content: bytes) -> str:
-    return ''.join(format(byte, '08b') for byte in content)
-
-def binary_to_content(binary_str: str) -> bytes:
-    return bytes(int(binary_str[i:i+8], 2) for i in range(0, len(binary_str), 8))
 
 @app.post("/encode")
 async def encode(
@@ -42,11 +39,11 @@ async def encode(
     passcode: str = Form(...)
 ):
     try:
-        # Load image (converting to RGBA first fixes the palette warning you got in logs)
+        # Load image and convert to numpy array instantly
         img = Image.open(io.BytesIO(await carrier.read())).convert('RGBA').convert('RGB')
-        pixels = img.load()
-        width, height = img.size
+        img_arr = np.array(img)
         
+        # Prepare payload
         if text_data:
             content_bytes = text_data.encode('utf-8')
             raw_payload = bytes([CONTENT_TEXT]) + content_bytes
@@ -57,33 +54,30 @@ async def encode(
         else:
             raise ValueError("No payload provided.")
 
-        # Encrypt
+        # Encrypt and add delimiter
         cipher = generate_key(passcode)
-        encrypted = cipher.encrypt(raw_payload)
-        binary_data = content_to_binary(encrypted) + DELIMITER
-        total_bits = len(binary_data)
+        encrypted_payload = cipher.encrypt(raw_payload) + DELIMITER
 
-        if total_bits > (width * height * 3):
-            raise ValueError("Carrier image capacity exceeded. Use a larger image.")
+        # VECTORIZED BIT EXTRACTION (Lightning Fast)
+        # Convert bytes directly to an array of bits [1, 0, 1, 1...]
+        bit_arr = np.unpackbits(np.frombuffer(encrypted_payload, dtype=np.uint8))
+        total_bits = len(bit_arr)
 
-        # Hide Data (Memory Optimized - Sequential LSB)
-        idx = 0
-        for y in range(height):
-            for x in range(width):
-                for c in range(3):
-                    if idx < total_bits:
-                        pixel = list(pixels[x, y])
-                        pixel[c] = (pixel[c] & ~1) | int(binary_data[idx])
-                        pixels[x, y] = tuple(pixel)
-                        idx += 1
-                    else:
-                        break
-                if idx >= total_bits: break
-            if idx >= total_bits: break
+        # Flatten image array to 1D
+        flat_img = img_arr.flatten()
 
-        # Return Image
+        if total_bits > len(flat_img):
+            raise ValueError("Carrier image capacity exceeded. Use a larger image or smaller file.")
+
+        # VECTORIZED LSB MODIFICATION (The Magic Trick)
+        # 1. Clear the LSB of the pixels we need to modify (bitwise AND with ~1 / 254)
+        # 2. Inject the payload bits (bitwise OR with bit_arr)
+        flat_img[:total_bits] = (flat_img[:total_bits] & ~1) | bit_arr
+
+        # Reshape back to image dimensions and save
+        encoded_img = Image.fromarray(flat_img.reshape(img_arr.shape))
         img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format='PNG')
+        encoded_img.save(img_byte_arr, format='PNG')
         
         return Response(
             content=img_byte_arr.getvalue(), 
@@ -100,31 +94,27 @@ async def decode(
     passcode: str = Form(...)
 ):
     try:
+        # Load image as numpy array
         img = Image.open(io.BytesIO(await stego_image.read())).convert('RGBA').convert('RGB')
-        pixels = img.load()
-        width, height = img.size
+        flat_img = np.array(img).flatten()
         
-        binary_data = ''
+        # VECTORIZED LSB EXTRACTION (Lightning Fast)
+        # 1. Extract the LSB from EVERY pixel instantly
+        extracted_bits = flat_img & 1
         
-        # Extract bits (Memory Optimized)
-        for y in range(height):
-            for x in range(width):
-                for c in range(3):
-                    pixel = pixels[x, y]
-                    binary_data += str(pixel[c] & 1)
-                    if binary_data.endswith(DELIMITER):
-                        break
-                if binary_data.endswith(DELIMITER): break
-            if binary_data.endswith(DELIMITER): break
-                
-        if not binary_data.endswith(DELIMITER):
-            raise ValueError("No hidden data found.")
+        # 2. Pack the bits back into bytes instantly
+        extracted_bytes = np.packbits(extracted_bits).tobytes()
+        
+        # Find the delimiter to know where the data ends
+        end_idx = extracted_bytes.find(DELIMITER)
+        
+        if end_idx == -1:
+            raise ValueError("No hidden data found or corrupted image.")
 
-        # Clean delimiter and Decrypt
-        binary_data = binary_data[:-len(DELIMITER)]
-        encrypted = binary_to_content(binary_data)
+        # Isolate the encrypted portion and decrypt
+        encrypted_data = extracted_bytes[:end_idx]
         cipher = generate_key(passcode)
-        decrypted = cipher.decrypt(encrypted)
+        decrypted = cipher.decrypt(encrypted_data)
 
         ctype = decrypted[0]
         data = decrypted[1:]

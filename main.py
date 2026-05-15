@@ -3,28 +3,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from cryptography.fernet import Fernet
 import base64
-import hashlib
-import io
-import random
 import urllib.parse
+import io
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "*",                                      
-        "https://cj7-code-journey.github.io"      
+        "*", 
+        "https://cj7-code-journey.github.io"
     ], 
-    allow_credentials=False,                      
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"]       
+    expose_headers=["Content-Disposition"]
 )
 
-# Constants from your code
 CONTENT_TEXT = 0
-CONTENT_FILE = 2 # We treat Image, File, Audio, Video all as binary files for web simplicity
+CONTENT_FILE = 2 
 DELIMITER = '1111111111111110'
 
 def generate_key(passcode: str) -> Fernet:
@@ -37,12 +34,6 @@ def content_to_binary(content: bytes) -> str:
 def binary_to_content(binary_str: str) -> bytes:
     return bytes(int(binary_str[i:i+8], 2) for i in range(0, len(binary_str), 8))
 
-def get_pixel_order(width, height, channels, passcode):
-    seed = int(hashlib.sha256(passcode.encode()).hexdigest()[:8], 16)
-    coords = [(x, y, c) for x in range(width) for y in range(height) for c in range(channels)]
-    random.Random(seed).shuffle(coords)
-    return coords
-
 @app.post("/encode")
 async def encode(
     carrier: UploadFile = File(...), 
@@ -51,44 +42,46 @@ async def encode(
     passcode: str = Form(...)
 ):
     try:
-        # 1. Read Carrier Image
-        img = Image.open(io.BytesIO(await carrier.read())).convert('RGB')
+        # Load image (converting to RGBA first fixes the palette warning you got in logs)
+        img = Image.open(io.BytesIO(await carrier.read())).convert('RGBA').convert('RGB')
         pixels = img.load()
         width, height = img.size
         
-        # 2. Prepare Payload Bytes
         if text_data:
             content_bytes = text_data.encode('utf-8')
             raw_payload = bytes([CONTENT_TEXT]) + content_bytes
         elif payload:
             file_bytes = await payload.read()
             fname_bytes = payload.filename.encode('utf-8')
-            # Format: [TYPE] [FILENAME_LEN] [FILENAME] [FILE_DATA]
             raw_payload = bytes([CONTENT_FILE]) + bytes([len(fname_bytes)]) + fname_bytes + file_bytes
         else:
             raise ValueError("No payload provided.")
 
-        # 3. Encrypt
+        # Encrypt
         cipher = generate_key(passcode)
         encrypted = cipher.encrypt(raw_payload)
         binary_data = content_to_binary(encrypted) + DELIMITER
+        total_bits = len(binary_data)
 
-        if len(binary_data) > (width * height * 3):
-            raise ValueError("Carrier image capacity exceeded. Use a larger image or smaller payload.")
+        if total_bits > (width * height * 3):
+            raise ValueError("Carrier image capacity exceeded. Use a larger image.")
 
-        # 4. Hide Data (Randomized LSB)
-        pixel_order = get_pixel_order(width, height, 3, passcode)
+        # Hide Data (Memory Optimized - Sequential LSB)
         idx = 0
-        
-        for x, y, c in pixel_order:
-            if idx >= len(binary_data): break
-            pixel = list(pixels[x, y])
-            # Modify the LSB of the specific color channel
-            pixel[c] = (pixel[c] & ~1) | int(binary_data[idx])
-            pixels[x, y] = tuple(pixel)
-            idx += 1
+        for y in range(height):
+            for x in range(width):
+                for c in range(3):
+                    if idx < total_bits:
+                        pixel = list(pixels[x, y])
+                        pixel[c] = (pixel[c] & ~1) | int(binary_data[idx])
+                        pixels[x, y] = tuple(pixel)
+                        idx += 1
+                    else:
+                        break
+                if idx >= total_bits: break
+            if idx >= total_bits: break
 
-        # 5. Return Image
+        # Return Image
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format='PNG')
         
@@ -107,25 +100,28 @@ async def decode(
     passcode: str = Form(...)
 ):
     try:
-        img = Image.open(io.BytesIO(await stego_image.read())).convert('RGB')
+        img = Image.open(io.BytesIO(await stego_image.read())).convert('RGBA').convert('RGB')
         pixels = img.load()
         width, height = img.size
         
         binary_data = ''
-        pixel_order = get_pixel_order(width, height, 3, passcode)
         
-        # Extract bits
-        for x, y, c in pixel_order:
-            pixel = pixels[x, y]
-            binary_data += str(pixel[c] & 1)
-            if binary_data.endswith(DELIMITER):
-                binary_data = binary_data[:-len(DELIMITER)]
-                break
+        # Extract bits (Memory Optimized)
+        for y in range(height):
+            for x in range(width):
+                for c in range(3):
+                    pixel = pixels[x, y]
+                    binary_data += str(pixel[c] & 1)
+                    if binary_data.endswith(DELIMITER):
+                        break
+                if binary_data.endswith(DELIMITER): break
+            if binary_data.endswith(DELIMITER): break
                 
-        if not binary_data:
-            raise ValueError("No hidden data found or wrong password.")
+        if not binary_data.endswith(DELIMITER):
+            raise ValueError("No hidden data found.")
 
-        # Decrypt
+        # Clean delimiter and Decrypt
+        binary_data = binary_data[:-len(DELIMITER)]
         encrypted = binary_to_content(binary_data)
         cipher = generate_key(passcode)
         decrypted = cipher.decrypt(encrypted)
@@ -133,7 +129,6 @@ async def decode(
         ctype = decrypted[0]
         data = decrypted[1:]
 
-        # Handle Return Data
         if ctype == CONTENT_TEXT:
             return {"type": "text", "data": data.decode('utf-8')}
         
@@ -141,8 +136,6 @@ async def decode(
             fname_len = data[0]
             filename = data[1:1+fname_len].decode('utf-8')
             file_data = data[1+fname_len:]
-            
-            # Encode filename to handle spaces/special characters in headers properly
             safe_filename = urllib.parse.quote(filename)
             
             return Response(

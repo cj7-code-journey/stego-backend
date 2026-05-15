@@ -72,7 +72,8 @@ async def encode(
         # VECTORIZED LSB MODIFICATION (The Magic Trick)
         # 1. Clear the LSB of the pixels we need to modify (bitwise AND with ~1 / 254)
         # 2. Inject the payload bits (bitwise OR with bit_arr)
-        flat_img[:total_bits] = (flat_img[:total_bits] & ~1) | bit_arr
+        #  optimized line (Fix)
+        flat_img[:total_bits] = (flat_img[:total_bits] & 254) | bit_arr
 
         # Reshape back to image dimensions and save
         encoded_img = Image.fromarray(flat_img.reshape(img_arr.shape))

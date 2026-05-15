@@ -12,10 +12,14 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow frontend to access
-    allow_credentials=False,
+    allow_origins=[
+        "*",                                      
+        "https://cj7-code-journey.github.io"      
+    ], 
+    allow_credentials=False,                      
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"]       
 )
 
 # Constants from your code
